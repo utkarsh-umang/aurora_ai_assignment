@@ -1,21 +1,19 @@
 import argparse
+import asyncio
 import json
-import operator
 import os
 import sys
-from typing import Annotated
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
 from typing_extensions import TypedDict
 
 # Make sure sibling packages are importable when run directly
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from data.scraper import run_scraper
-from data.voice_ai import run_voice_ai
+from agent.kafka_async import load_kafka_config, request_scrape_and_wait, request_voice_and_wait_all
 
 load_dotenv()
 
@@ -27,9 +25,6 @@ load_dotenv()
 class PipelineState(TypedDict):
     user_query: str
     refined_query: str
-    scraper_results: list[dict]
-    voice_ai_results: Annotated[list[dict], operator.add]
-    final_answer: str
 
 
 # ---------------------------------------------------------------------------
@@ -40,11 +35,11 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 
 
 # ---------------------------------------------------------------------------
-# Nodes
+# Node: refine query (LangGraph)
 # ---------------------------------------------------------------------------
 
 def refine_query(state: PipelineState) -> dict:
-    print(f"\n[1/4] Refining query...")
+    print(f"\n[1/3] Refining query (LLM)...")
     response = llm.invoke(
         [
             {
@@ -64,32 +59,9 @@ def refine_query(state: PipelineState) -> dict:
     return {"refined_query": refined}
 
 
-def scrape(state: PipelineState) -> dict:
-    print(f"\n[2/4] Running scraper...")
-    results = run_scraper(state["refined_query"])
-    print(f"    Found {len(results)} businesses")
-    for r in results:
-        print(f"      - {r['business_name']} | {r['phone_number']} | score: {r['score']}")
-    return {"scraper_results": results}
-
-
-def voice_ai_fan_out(state: PipelineState) -> list[Send]:
-    print(f"\n[3/4] Fanning out to voice AI ({len(state['scraper_results'])} parallel nodes)...")
-    return [Send("voice_ai_process", business) for business in state["scraper_results"]]
-
-# Routing function used as a conditional edge (not a node)
-def _route_voice_ai(state: PipelineState) -> list[Send]:
-    return voice_ai_fan_out(state)
-
-
-def voice_ai_process(business: dict) -> dict:
-    result = run_voice_ai(business)
-    return {"voice_ai_results": [result]}
-
-
-def summarize(state: PipelineState) -> dict:
-    print(f"\n[4/4] Generating final answer...")
-    results_text = json.dumps(state["voice_ai_results"], indent=2)
+def summarize_inline(*, user_query: str, voice_ai_results: list[dict]) -> str:
+    print(f"\n[3/3] Generating final answer (LLM)...")
+    results_text = json.dumps(voice_ai_results, indent=2)
     response = llm.invoke(
         [
             {
@@ -104,34 +76,41 @@ def summarize(state: PipelineState) -> dict:
             {
                 "role": "user",
                 "content": (
-                    f"User query: {state['user_query']}\n\n"
+                    f"User query: {user_query}\n\n"
                     f"Evaluated businesses:\n{results_text}"
                 ),
             },
         ]
     )
-    return {"final_answer": response.content.strip()}
+    return response.content.strip()
 
 
 # ---------------------------------------------------------------------------
 # Graph
 # ---------------------------------------------------------------------------
 
-def build_graph() -> StateGraph:
+def build_refine_graph() -> StateGraph:
     graph = StateGraph(PipelineState)
-
     graph.add_node("refine_query", refine_query)
-    graph.add_node("scrape", scrape)
-    graph.add_node("voice_ai_process", voice_ai_process)
-    graph.add_node("summarize", summarize)
-
     graph.add_edge(START, "refine_query")
-    graph.add_edge("refine_query", "scrape")
-    graph.add_conditional_edges("scrape", _route_voice_ai, ["voice_ai_process"])
-    graph.add_edge("voice_ai_process", "summarize")
-    graph.add_edge("summarize", END)
-
+    graph.add_edge("refine_query", END)
     return graph.compile()
+
+
+async def run_kafka_steps(*, refined_query: str, job_id: str) -> list[dict]:
+    cfg = load_kafka_config()
+
+    print(f"\n[2/3] Running scraper + voice AI via Kafka...")
+    businesses = await request_scrape_and_wait(cfg=cfg, job_id=job_id, refined_query=refined_query)
+    print(f"    Found {len(businesses)} businesses")
+    for r in businesses:
+        name = r.get("business_name")
+        phone = r.get("phone_number")
+        score = r.get("score")
+        print(f"      - {name} | {phone} | score: {score}")
+
+    voice_results = await request_voice_and_wait_all(cfg=cfg, job_id=job_id, businesses=businesses)
+    return voice_results
 
 
 # ---------------------------------------------------------------------------
@@ -154,14 +133,18 @@ def main():
         print("No query provided. Exiting.")
         sys.exit(1)
 
-    app = build_graph()
+    job_id = str(uuid4())
+    app = build_refine_graph()
+    refine_state = app.invoke({"user_query": query})
+    refined_query = refine_state["refined_query"]
 
-    final_state = app.invoke({"user_query": query, "voice_ai_results": []})
+    voice_ai_results = asyncio.run(run_kafka_steps(refined_query=refined_query, job_id=job_id))
+    final_answer = summarize_inline(user_query=query, voice_ai_results=voice_ai_results)
 
     print("\n" + "=" * 60)
     print("FINAL ANSWER")
     print("=" * 60)
-    print(final_state["final_answer"])
+    print(final_answer)
     print("=" * 60 + "\n")
 
 
