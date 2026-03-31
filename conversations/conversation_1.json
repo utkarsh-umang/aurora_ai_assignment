@@ -1,0 +1,12 @@
+{
+  "conversations": [
+    {
+      "role": "user",
+      "content": "I need a good plumber in San Francisco"
+    },
+    {
+      "role": "user",
+      "content": "what about electricians, same area"
+    }
+  ]
+}

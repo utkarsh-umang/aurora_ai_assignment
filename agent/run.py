@@ -15,8 +15,54 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agent.kafka_async import load_kafka_config, request_scrape_and_wait, request_voice_and_wait_all
 from agent.observability import RunTrace
+from data.voice_ai import run_voice_ai_retry
 
 load_dotenv()
+
+_MEMORY_PATH = os.path.join(os.path.dirname(__file__), "..", "out", "memory.json")
+
+
+def load_memory() -> list[dict]:
+    if not os.path.exists(_MEMORY_PATH):
+        return []
+    try:
+        with open(_MEMORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("conversations", [])
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_memory(conversations: list[dict], *, new_entry: dict) -> None:
+    conversations.append(new_entry)
+    os.makedirs(os.path.dirname(_MEMORY_PATH), exist_ok=True)
+    with open(_MEMORY_PATH, "w", encoding="utf-8") as f:
+        json.dump({"conversations": conversations}, f, indent=2, ensure_ascii=False)
+
+
+def handle_retries(voice_ai_results: list[dict]) -> list[dict]:
+    """
+    Prompt user for failed/callback calls. Returns only completed results
+    (originals + accepted retries). Declined businesses are excluded from the summary.
+    """
+    completed = []
+    for result in voice_ai_results:
+        status = result.get("call_status", "completed")
+        name = result.get("business_name", "Unknown Business")
+
+        if status == "failed":
+            ans = input(f"\nCall with {name} failed. Retry? (y/n): ").strip().lower()
+            if ans == "y":
+                print(f"  Retrying {name} (waiting 2s)...")
+                completed.append(run_voice_ai_retry(result))
+        elif status == "callback_requested":
+            ans = input(f"\n{name} asked to call back later. Retry? (y/n): ").strip().lower()
+            if ans == "y":
+                print(f"  Retrying {name}...")
+                completed.append(run_voice_ai_retry(result))
+        else:
+            completed.append(result)
+    return completed
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +87,20 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 
 def refine_query(state: PipelineState) -> dict:
     print(f"\n[1/3] Refining query (LLM)...")
+
+    conversations = load_memory()
+    memory_block = ""
+    if conversations:
+        recent = conversations[-5:]
+        lines = ["Previous searches (most recent last):"]
+        for c in recent:
+            lines.append(
+                f"  - Query: \"{c.get('user_query', '')}\" → "
+                f"Refined: \"{c.get('refined_query', '')}\" | "
+                f"Passed: {c.get('passed_businesses', [])}"
+            )
+        memory_block = "\n" + "\n".join(lines) + "\n"
+
     response = llm.invoke(
         [
             {
@@ -49,6 +109,7 @@ def refine_query(state: PipelineState) -> dict:
                     "You are a search query optimizer. Rewrite the user's query to be "
                     "more specific and effective for finding local businesses. "
                     "Return only the refined query, nothing else."
+                    + memory_block
                 ),
             },
             {"role": "user", "content": state["user_query"]},
@@ -144,18 +205,35 @@ def main():
     trace.record("query_refined", original=query, refined=refined_query)
 
     voice_ai_results = asyncio.run(run_kafka_steps(refined_query=refined_query, job_id=job_id, trace=trace))
-    final_answer = summarize_inline(user_query=query, voice_ai_results=voice_ai_results)
+
+    completed_results = handle_retries(voice_ai_results)
+
+    final_answer = summarize_inline(user_query=query, voice_ai_results=completed_results)
     trace.record("job_complete", final_answer=final_answer)
 
     trace.set_summary(
         user_query=query,
         refined_query=refined_query,
         businesses_found=len(voice_ai_results),
-        passed=[r.get("business_name") for r in voice_ai_results if r.get("pass_fail") == "pass"],
+        completed_calls=len(completed_results),
+        passed=[r.get("business_name") for r in completed_results if r.get("pass_fail") == "pass"],
     )
 
     out_dir = os.path.join(os.path.dirname(__file__), "..", "out")
     trace_path = trace.write(out_dir)
+
+    memory_entry = {
+        "timestamp": trace.started_at,
+        "job_id": job_id,
+        "user_query": query,
+        "refined_query": refined_query,
+        "passed_businesses": [
+            r.get("business_name") for r in completed_results if r.get("pass_fail") == "pass"
+        ],
+        "final_answer": final_answer,
+    }
+    conversations = load_memory()
+    save_memory(conversations, new_entry=memory_entry)
 
     print("\n" + "=" * 60)
     print("FINAL ANSWER")

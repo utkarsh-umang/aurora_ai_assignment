@@ -1,11 +1,33 @@
 #!/usr/bin/env bash
-# Usage: ./demo.sh [query]
-# Restarts Redpanda, launches all workers, then runs the pipeline in a new terminal.
+# Usage: ./demo.sh [conversation_file]
+# Restarts Redpanda, launches all workers, then runs each user message in the
+# conversation file sequentially so memory is written between turns.
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$PROJECT_DIR/.venv/bin/activate"
-QUERY="${1:-find plumbers in austin open now}"
+CONVERSATION="${1:-$PROJECT_DIR/conversations/conversation_1.json}"
+
+# Extract user messages in order using Python (always available in the venv)
+QUERIES=()
+while IFS= read -r line; do
+  QUERIES+=("$line")
+done < <(
+  source "$VENV"
+  python - <<EOF
+import json
+with open("$CONVERSATION") as f:
+    data = json.load(f)
+for msg in data["conversations"]:
+    if msg["role"] == "user":
+        print(msg["content"])
+EOF
+)
+
+if [ ${#QUERIES[@]} -eq 0 ]; then
+  echo "No user messages found in $CONVERSATION"
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Restart Redpanda
@@ -57,12 +79,22 @@ echo "==> Waiting 5s for workers to join consumer groups..."
 sleep 5
 
 # ---------------------------------------------------------------------------
-# 4. Run the pipeline
+# 4. Run each conversation turn sequentially in this terminal
 # ---------------------------------------------------------------------------
-echo "==> Launching pipeline in new terminal..."
-open_term "cd '$PROJECT_DIR' && source '$VENV' && python -m agent.run --query '$QUERY'" "aurora-run"
+source "$VENV"
+cd "$PROJECT_DIR"
+
+TOTAL=${#QUERIES[@]}
+for i in "${!QUERIES[@]}"; do
+  TURN=$((i + 1))
+  QUERY="${QUERIES[$i]}"
+  echo ""
+  echo "==> Turn $TURN/$TOTAL: \"$QUERY\""
+  echo "------------------------------------------------------------"
+  python -m agent.run --query "$QUERY"
+  echo "------------------------------------------------------------"
+  echo "Turn $TURN complete. Trace written to out/<job_id>/trace.json"
+done
 
 echo ""
-echo "All terminals launched. Watch the voice-worker windows — with 3 workers"
-echo "consuming from 6 partitions, calls should now process in parallel."
-echo "Trace will be written to: $PROJECT_DIR/out/<job_id>/trace.json"
+echo "All $TOTAL turns complete. Memory saved to: $PROJECT_DIR/out/memory.json"
