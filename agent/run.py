@@ -40,38 +40,18 @@ def save_memory(conversations: list[dict], *, new_entry: dict) -> None:
         json.dump({"conversations": conversations}, f, indent=2, ensure_ascii=False)
 
 
-def handle_retries(voice_ai_results: list[dict]) -> list[dict]:
-    """
-    Prompt user for failed/callback calls. Returns only completed results
-    (originals + accepted retries). Declined businesses are excluded from the summary.
-    """
-    completed = []
-    for result in voice_ai_results:
-        status = result.get("call_status", "completed")
-        name = result.get("business_name", "Unknown Business")
-
-        if status == "failed":
-            ans = input(f"\nCall with {name} failed. Retry? (y/n): ").strip().lower()
-            if ans == "y":
-                print(f"  Retrying {name} (waiting 2s)...")
-                completed.append(run_voice_ai_retry(result))
-        elif status == "callback_requested":
-            ans = input(f"\n{name} asked to call back later. Retry? (y/n): ").strip().lower()
-            if ans == "y":
-                print(f"  Retrying {name}...")
-                completed.append(run_voice_ai_retry(result))
-        else:
-            completed.append(result)
-    return completed
-
-
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
 class PipelineState(TypedDict):
     user_query: str
+    job_id: str
     refined_query: str
+    voice_results: list[dict]      # all raw results from Kafka (any call_status)
+    completed_results: list[dict]  # call_status=="completed" only (original + retried)
+    retries_done: int
+    final_answer: str
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +62,7 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 
 
 # ---------------------------------------------------------------------------
-# Node: refine query (LangGraph)
+# Nodes
 # ---------------------------------------------------------------------------
 
 def refine_query(state: PipelineState) -> dict:
@@ -121,9 +101,18 @@ def refine_query(state: PipelineState) -> dict:
     return {"refined_query": refined}
 
 
-def summarize_inline(*, user_query: str, voice_ai_results: list[dict]) -> str:
+def summarize_inline(*, user_query: str, voice_ai_results: list[dict], postponed_businesses: list[dict] | None = None) -> str:
     print(f"\n[3/3] Generating final answer (LLM)...")
     results_text = json.dumps(voice_ai_results, indent=2)
+
+    postponed_note = ""
+    if postponed_businesses:
+        names = [r.get("business_name", "Unknown") for r in postponed_businesses]
+        postponed_note = (
+            f"\n\nNote: The following businesses asked to be called back later and were not evaluated: "
+            f"{', '.join(names)}. Please mention this clearly in your summary."
+        )
+
     response = llm.invoke(
         [
             {
@@ -140,6 +129,7 @@ def summarize_inline(*, user_query: str, voice_ai_results: list[dict]) -> str:
                 "content": (
                     f"User query: {user_query}\n\n"
                     f"Evaluated businesses:\n{results_text}"
+                    + postponed_note
                 ),
             },
         ]
@@ -151,28 +141,69 @@ def summarize_inline(*, user_query: str, voice_ai_results: list[dict]) -> str:
 # Graph
 # ---------------------------------------------------------------------------
 
-def build_refine_graph() -> StateGraph:
+def build_pipeline(*, trace: RunTrace) -> StateGraph:
+
+    def run_voice_calls(state: PipelineState) -> dict:
+        cfg = load_kafka_config()
+        print(f"\n[2/3] Running scraper + voice AI via Kafka...")
+
+        businesses = asyncio.run(
+            request_scrape_and_wait(
+                cfg=cfg, job_id=state["job_id"], refined_query=state["refined_query"], trace=trace
+            )
+        )
+        print(f"    Found {len(businesses)} businesses")
+        for b in businesses:
+            print(f"      - {b.get('business_name')} | {b.get('phone_number')} | score: {b.get('score')}")
+
+        voice_results = asyncio.run(
+            request_voice_and_wait_all(
+                cfg=cfg, job_id=state["job_id"], businesses=businesses, trace=trace
+            )
+        )
+        completed = [r for r in voice_results if r.get("call_status") == "completed"]
+        return {"voice_results": voice_results, "completed_results": completed, "retries_done": 0}
+
+    def retry_failed_calls(state: PipelineState) -> dict:
+        failed = [r for r in state["voice_results"] if r.get("call_status") == "failed"]
+        print(f"\n[*] Retrying {len(failed)} failed call(s)...")
+        retried = []
+        for r in failed:
+            print(f"    Retrying {r.get('business_name')} (waiting 2s)...")
+            retried.append(run_voice_ai_retry(r))
+        return {
+            "completed_results": state["completed_results"] + retried,
+            "retries_done": state["retries_done"] + 1,
+        }
+
+    def should_retry(state: PipelineState) -> str:
+        failed = [r for r in state["voice_results"] if r.get("call_status") == "failed"]
+        if failed and state["retries_done"] < 1:
+            return "retry"
+        return "summarize"
+
+    def summarize_node(state: PipelineState) -> dict:
+        postponed = [r for r in state["voice_results"] if r.get("call_status") == "callback_requested"]
+        final_answer = summarize_inline(
+            user_query=state["user_query"],
+            voice_ai_results=state["completed_results"],
+            postponed_businesses=postponed if postponed else None,
+        )
+        return {"final_answer": final_answer}
+
     graph = StateGraph(PipelineState)
     graph.add_node("refine_query", refine_query)
+    graph.add_node("run_voice_calls", run_voice_calls)
+    graph.add_node("retry_failed_calls", retry_failed_calls)
+    graph.add_node("summarize", summarize_node)
+
     graph.add_edge(START, "refine_query")
-    graph.add_edge("refine_query", END)
+    graph.add_edge("refine_query", "run_voice_calls")
+    graph.add_conditional_edges("run_voice_calls", should_retry, {"retry": "retry_failed_calls", "summarize": "summarize"})
+    graph.add_edge("retry_failed_calls", "summarize")
+    graph.add_edge("summarize", END)
+
     return graph.compile()
-
-
-async def run_kafka_steps(*, refined_query: str, job_id: str, trace: RunTrace) -> list[dict]:
-    cfg = load_kafka_config()
-
-    print(f"\n[2/3] Running scraper + voice AI via Kafka...")
-    businesses = await request_scrape_and_wait(cfg=cfg, job_id=job_id, refined_query=refined_query, trace=trace)
-    print(f"    Found {len(businesses)} businesses")
-    for r in businesses:
-        name = r.get("business_name")
-        phone = r.get("phone_number")
-        score = r.get("score")
-        print(f"      - {name} | {phone} | score: {score}")
-
-    voice_results = await request_voice_and_wait_all(cfg=cfg, job_id=job_id, businesses=businesses, trace=trace)
-    return voice_results
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +212,7 @@ async def run_kafka_steps(*, refined_query: str, job_id: str, trace: RunTrace) -
 
 def main():
     parser = argparse.ArgumentParser(description="Aurora AI business search pipeline")
-    parser.add_argument(
-        "--query",
-        type=str,
-        help="The search query to process",
-    )
+    parser.add_argument("--query", type=str, help="The search query to process")
     args = parser.parse_args()
 
     query = args.query
@@ -199,22 +226,28 @@ def main():
     trace = RunTrace(job_id=job_id)
     trace.record("job_started", user_query=query)
 
-    app = build_refine_graph()
-    refine_state = app.invoke({"user_query": query})
-    refined_query = refine_state["refined_query"]
+    app = build_pipeline(trace=trace)
+    final_state = app.invoke({
+        "user_query": query,
+        "job_id": job_id,
+        "refined_query": "",
+        "voice_results": [],
+        "completed_results": [],
+        "retries_done": 0,
+        "final_answer": "",
+    })
+
+    refined_query = final_state["refined_query"]
+    voice_results = final_state["voice_results"]
+    completed_results = final_state["completed_results"]
+    final_answer = final_state["final_answer"]
+
     trace.record("query_refined", original=query, refined=refined_query)
-
-    voice_ai_results = asyncio.run(run_kafka_steps(refined_query=refined_query, job_id=job_id, trace=trace))
-
-    completed_results = handle_retries(voice_ai_results)
-
-    final_answer = summarize_inline(user_query=query, voice_ai_results=completed_results)
     trace.record("job_complete", final_answer=final_answer)
-
     trace.set_summary(
         user_query=query,
         refined_query=refined_query,
-        businesses_found=len(voice_ai_results),
+        businesses_found=len(voice_results),
         completed_calls=len(completed_results),
         passed=[r.get("business_name") for r in completed_results if r.get("pass_fail") == "pass"],
     )
