@@ -15,7 +15,7 @@ _PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _PROJECT_ROOT)
 load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
-from agent.kafka_async import KafkaConfig, load_kafka_config
+from agent.kafka_async import KafkaConfig, ensure_topics, load_kafka_config
 from agent.kafka_events import (
     make_scrape_result,
     make_voice_result,
@@ -52,6 +52,7 @@ async def _consumer(cfg: KafkaConfig, *, topic: str, group_id: str) -> AIOKafkaC
 
 
 async def run_scrape_worker(cfg: KafkaConfig, *, group_id: str) -> None:
+    await ensure_topics(cfg)
     consumer = await _consumer(cfg, topic=cfg.scrape_topic, group_id=group_id)
     producer = await _producer(cfg)
     try:
@@ -64,7 +65,8 @@ async def run_scrape_worker(cfg: KafkaConfig, *, group_id: str) -> None:
             job_id = evt["job_id"]
             refined_query = evt["refined_query"]
             print(f"[scrape_worker] job_id={job_id} query={refined_query!r}")
-            businesses = run_scraper(refined_query)
+            loop = asyncio.get_running_loop()
+            businesses = await loop.run_in_executor(None, run_scraper, refined_query)
             await producer.send_and_wait(cfg.scrape_topic, _json_dumps(make_scrape_result(job_id=job_id, businesses=businesses)))
             print(f"[scrape_worker] job_id={job_id} produced scrape_result businesses={len(businesses)}")
     finally:
@@ -73,6 +75,7 @@ async def run_scrape_worker(cfg: KafkaConfig, *, group_id: str) -> None:
 
 
 async def run_voice_worker(cfg: KafkaConfig, *, group_id: str) -> None:
+    await ensure_topics(cfg)
     consumer = await _consumer(cfg, topic=cfg.voice_topic, group_id=group_id)
     producer = await _producer(cfg)
     try:
@@ -86,7 +89,8 @@ async def run_voice_worker(cfg: KafkaConfig, *, group_id: str) -> None:
             call_id = evt["call_id"]
             business = evt["business"]
             print(f"[voice_worker] job_id={job_id} call_id={call_id} business={business.get('business_name')!r}")
-            result = run_voice_ai(business)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, run_voice_ai, business)
             await producer.send_and_wait(cfg.voice_topic, _json_dumps(make_voice_result(job_id=job_id, call_id=call_id, result=result)))
             print(f"[voice_worker] job_id={job_id} call_id={call_id} produced voice_result")
     finally:

@@ -14,6 +14,7 @@ from typing_extensions import TypedDict
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agent.kafka_async import load_kafka_config, request_scrape_and_wait, request_voice_and_wait_all
+from agent.observability import RunTrace
 
 load_dotenv()
 
@@ -97,11 +98,11 @@ def build_refine_graph() -> StateGraph:
     return graph.compile()
 
 
-async def run_kafka_steps(*, refined_query: str, job_id: str) -> list[dict]:
+async def run_kafka_steps(*, refined_query: str, job_id: str, trace: RunTrace) -> list[dict]:
     cfg = load_kafka_config()
 
     print(f"\n[2/3] Running scraper + voice AI via Kafka...")
-    businesses = await request_scrape_and_wait(cfg=cfg, job_id=job_id, refined_query=refined_query)
+    businesses = await request_scrape_and_wait(cfg=cfg, job_id=job_id, refined_query=refined_query, trace=trace)
     print(f"    Found {len(businesses)} businesses")
     for r in businesses:
         name = r.get("business_name")
@@ -109,7 +110,7 @@ async def run_kafka_steps(*, refined_query: str, job_id: str) -> list[dict]:
         score = r.get("score")
         print(f"      - {name} | {phone} | score: {score}")
 
-    voice_results = await request_voice_and_wait_all(cfg=cfg, job_id=job_id, businesses=businesses)
+    voice_results = await request_voice_and_wait_all(cfg=cfg, job_id=job_id, businesses=businesses, trace=trace)
     return voice_results
 
 
@@ -134,18 +135,34 @@ def main():
         sys.exit(1)
 
     job_id = str(uuid4())
+    trace = RunTrace(job_id=job_id)
+    trace.record("job_started", user_query=query)
+
     app = build_refine_graph()
     refine_state = app.invoke({"user_query": query})
     refined_query = refine_state["refined_query"]
+    trace.record("query_refined", original=query, refined=refined_query)
 
-    voice_ai_results = asyncio.run(run_kafka_steps(refined_query=refined_query, job_id=job_id))
+    voice_ai_results = asyncio.run(run_kafka_steps(refined_query=refined_query, job_id=job_id, trace=trace))
     final_answer = summarize_inline(user_query=query, voice_ai_results=voice_ai_results)
+    trace.record("job_complete", final_answer=final_answer)
+
+    trace.set_summary(
+        user_query=query,
+        refined_query=refined_query,
+        businesses_found=len(voice_ai_results),
+        passed=[r.get("business_name") for r in voice_ai_results if r.get("pass_fail") == "pass"],
+    )
+
+    out_dir = os.path.join(os.path.dirname(__file__), "..", "out")
+    trace_path = trace.write(out_dir)
 
     print("\n" + "=" * 60)
     print("FINAL ANSWER")
     print("=" * 60)
     print(final_answer)
     print("=" * 60 + "\n")
+    print(f"[trace] Written to {trace_path}")
 
 
 if __name__ == "__main__":

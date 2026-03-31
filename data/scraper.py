@@ -1,4 +1,5 @@
 import random
+import time
 
 _BUSINESS_NAMES = [
     "Apex Plumbing Co.",
@@ -32,6 +33,9 @@ def run_scraper(refined_query: str) -> list[dict]:
     Returns:
         A list of dicts with keys: business_name, phone_number, score.
     """
+    latency = random.uniform(2.0, 5.0)
+    time.sleep(latency)
+
     count = random.randint(3, 6)
     businesses = random.sample(_BUSINESS_NAMES, count)
 

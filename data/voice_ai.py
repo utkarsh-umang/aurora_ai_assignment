@@ -1,4 +1,5 @@
 import random
+import time
 
 _PASS_COMMENTS = [
     "Business has high ratings and responsive communication.",
@@ -27,6 +28,9 @@ def run_voice_ai(business: dict) -> dict:
     Returns:
         The same dict with pass_fail ("pass" or "no pass") and comment added.
     """
+    latency = random.uniform(5.0, 10.0)
+    time.sleep(latency)
+
     passed = random.random() > 0.4  # ~60% pass rate
 
     result = dict(business)
